@@ -54,101 +54,6 @@ impl Default for GasOverheads {
     }
 }
 
-/// Returns the required pre_verification_gas for the given user operation
-///
-/// `full_op` is either the user operation submitted via `sendUserOperation`
-/// or the user operation that was submitted via `estimateUserOperationGas` and filled
-/// in via its `max_fill()` call. It is used to calculate the static portion of the pre_verification_gas
-///
-/// `random_op` is either the user operation submitted via `sendUserOperation`
-/// or the user operation that was submitted via `estimateUserOperationGas` and filled
-/// in via its `random_fill()` call. It is used to calculate the dynamic portion of the pre_verification_gas
-/// on networks that require it.
-///
-/// Networks that require dynamic pre_verification_gas are typically those that charge extra calldata fees
-/// that can scale based on dynamic gas prices.
-pub async fn calc_pre_verification_gas<P: Provider>(
-    full_op: &UserOperation,
-    random_op: &UserOperation,
-    entry_point: Address,
-    provider: Arc<P>,
-    chain_id: u64,
-) -> anyhow::Result<U256> {
-    let static_gas = calc_static_pre_verification_gas(full_op);
-    let dynamic_gas = match chain_id {
-        _ if ARBITRUM_CHAIN_IDS.contains(&chain_id) => {
-            provider
-                .clone()
-                .calc_arbitrum_l1_gas(entry_point, random_op.clone())
-                .await?
-        }
-        _ if OP_BEDROCK_CHAIN_IDS.contains(&chain_id) => {
-            provider
-                .clone()
-                .calc_optimism_l1_gas(entry_point, random_op.clone())
-                .await?
-        }
-        _ => U256::zero(),
-    };
-
-    Ok(static_gas + dynamic_gas)
-}
-
-/// Returns the gas limit for the user operation that applies to bundle transaction's limit
-pub fn user_operation_gas_limit(uo: &UserOperation, chain_id: u64) -> U256 {
-    // On some chains (OP bedrock, Arbitrum) the L1 gas fee is charged via pre_verification_gas
-    // but this not part of the execution gas limit of the transaction.
-    // In such cases we only consider the static portion of the pre_verification_gas in the gas limit.
-    let pvg = if OP_BEDROCK_CHAIN_IDS.contains(&chain_id) | ARBITRUM_CHAIN_IDS.contains(&chain_id) {
-        calc_static_pre_verification_gas(uo)
-    } else {
-        uo.pre_verification_gas
-    };
-
-    pvg + uo.call_gas_limit + uo.verification_gas_limit * verification_gas_limit_multiplier(uo)
-}
-
-/// Returns the maximum cost, in wei, of this user operation
-pub fn user_operation_max_gas_cost(uo: &UserOperation) -> U256 {
-    let mul = if uo.paymaster().is_some() { 3 } else { 1 };
-    uo.max_fee_per_gas
-        * (uo.pre_verification_gas + uo.call_gas_limit + uo.verification_gas_limit * mul)
-}
-
-fn calc_static_pre_verification_gas(op: &UserOperation) -> U256 {
-    let ov = GasOverheads::default();
-    let encoded_op = op.clone().encode();
-    let length_in_words = encoded_op.len() / 32; // size of packed user op is always a multiple of 32 bytes
-    let call_data_cost: U256 = encoded_op
-        .iter()
-        .map(|&x| {
-            if x == 0 {
-                ov.zero_byte
-            } else {
-                ov.non_zero_byte
-            }
-        })
-        .reduce(|a, b| a + b)
-        .unwrap_or_default();
-
-    ov.fixed / ov.bundle_size
-        + call_data_cost
-        + ov.per_user_op
-        + ov.per_user_op_word * length_in_words
-}
-
-fn verification_gas_limit_multiplier(uo: &UserOperation) -> u64 {
-    // If using a paymaster, we need to account for potentially 2 postOp
-    // calls (even though it won't be called).
-    // Else the entrypoint expects the gas for 1 postOp call that
-    // uses verification_gas_limit plus the actual verification call
-    if uo.paymaster().is_some() {
-        3
-    } else {
-        2
-    }
-}
-
 /// Different modes for calculating the required priority fee
 /// for the bundler to include a user operation in a bundle.
 #[derive(Debug, Clone, Copy)]
@@ -191,7 +96,7 @@ impl PriorityFeeMode {
 
 /// Gas fee estimator for a 4337 user operation.
 #[derive(Debug, Clone)]
-pub struct FeeEstimator<P: Provider> {
+pub struct BundleFeeEstimator<P: Provider> {
     provider: Arc<P>,
     priority_fee_mode: PriorityFeeMode,
     use_bundle_priority_fee: bool,
@@ -199,7 +104,7 @@ pub struct FeeEstimator<P: Provider> {
     chain_id: u64,
 }
 
-impl<P: Provider> FeeEstimator<P> {
+impl<P: Provider> BundleFeeEstimator<P> {
     /// Create a new fee estimator.
     ///
     /// `priority_fee_mode` is used to determine how the required priority fee is calculated.
@@ -220,7 +125,7 @@ impl<P: Provider> FeeEstimator<P> {
             provider,
             priority_fee_mode,
             use_bundle_priority_fee: use_bundle_priority_fee
-                .unwrap_or_else(|| !is_known_non_eip_1559_chain(chain_id)),
+                .unwrap_or_else(|| !Self::is_known_non_eip_1559_chain(chain_id)),
             bundle_priority_fee_overhead_percent,
             chain_id,
         }
@@ -273,6 +178,10 @@ impl<P: Provider> FeeEstimator<P> {
             Ok(U256::zero())
         }
     }
+
+    fn is_known_non_eip_1559_chain(chain_id: u64) -> bool {
+        NON_EIP_1559_CHAIN_IDS.contains(&chain_id)
+    }
 }
 
 const NON_EIP_1559_CHAIN_IDS: &[u64] = &[
@@ -281,6 +190,112 @@ const NON_EIP_1559_CHAIN_IDS: &[u64] = &[
     Chain::ArbitrumGoerli as u64,
 ];
 
-fn is_known_non_eip_1559_chain(chain_id: u64) -> bool {
-    NON_EIP_1559_CHAIN_IDS.contains(&chain_id)
+// Gas fee estimator for a 4337 user operation.
+#[derive(Debug, Clone)]
+pub struct UOFeeEstimator<P: Provider> {
+    provider: Arc<P>,
+    chain_id: u64,
+}
+
+impl<P: Provider> UOFeeEstimator<P> {
+    pub fn new(provider: Arc<P>, chain_id: u64) -> Self {
+        Self { provider, chain_id }
+    }
+
+    /// Returns the required pre_verification_gas for the given user operation
+    ///
+    /// `full_op` is either the user operation submitted via `sendUserOperation`
+    /// or the user operation that was submitted via `estimateUserOperationGas` and filled
+    /// in via its `max_fill()` call. It is used to calculate the static portion of the pre_verification_gas
+    ///
+    /// `random_op` is either the user operation submitted via `sendUserOperation`
+    /// or the user operation that was submitted via `estimateUserOperationGas` and filled
+    /// in via its `random_fill()` call. It is used to calculate the dynamic portion of the pre_verification_gas
+    /// on networks that require it.
+    ///
+    /// Networks that require dynamic pre_verification_gas are typically those that charge extra calldata fees
+    /// that can scale based on dynamic gas prices.
+    pub async fn calc_pre_verification_gas(
+        full_op: &UserOperation,
+        random_op: &UserOperation,
+        entry_point: Address,
+        provider: Arc<P>,
+        chain_id: u64,
+    ) -> anyhow::Result<U256> {
+        let static_gas = Self::calc_static_pre_verification_gas(full_op);
+        let dynamic_gas = match chain_id {
+            _ if ARBITRUM_CHAIN_IDS.contains(&chain_id) => {
+                provider
+                    .clone()
+                    .calc_arbitrum_l1_gas(entry_point, random_op.clone())
+                    .await?
+            }
+            _ if OP_BEDROCK_CHAIN_IDS.contains(&chain_id) => {
+                provider
+                    .clone()
+                    .calc_optimism_l1_gas(entry_point, random_op.clone())
+                    .await?
+            }
+            _ => U256::zero(),
+        };
+
+        Ok(static_gas + dynamic_gas)
+    }
+
+    /// Returns the gas limit for the user operation that applies to bundle transaction's limit
+    pub fn user_operation_gas_limit(&self, uo: &UserOperation, chain_id: u64) -> U256 {
+        // On some chains (OP bedrock, Arbitrum) the L1 gas fee is charged via pre_verification_gas
+        // but this not part of the execution gas limit of the transaction.
+        // In such cases we only consider the static portion of the pre_verification_gas in the gas limit.
+        let pvg =
+            if OP_BEDROCK_CHAIN_IDS.contains(&chain_id) | ARBITRUM_CHAIN_IDS.contains(&chain_id) {
+                Self::calc_static_pre_verification_gas(uo)
+            } else {
+                uo.pre_verification_gas
+            };
+
+        pvg + uo.call_gas_limit
+            + uo.verification_gas_limit * Self::verification_gas_limit_multiplier(uo)
+    }
+
+    /// Returns the maximum cost, in wei, of this user operation
+    pub fn user_operation_max_gas_cost(&self, uo: &UserOperation) -> U256 {
+        let mul = if uo.paymaster().is_some() { 3 } else { 1 };
+        uo.max_fee_per_gas
+            * (uo.pre_verification_gas + uo.call_gas_limit + uo.verification_gas_limit * mul)
+    }
+
+    pub fn calc_static_pre_verification_gas(op: &UserOperation) -> U256 {
+        let ov = GasOverheads::default();
+        let encoded_op = op.clone().encode();
+        let length_in_words = encoded_op.len() / 32; // size of packed user op is always a multiple of 32 bytes
+        let call_data_cost: U256 = encoded_op
+            .iter()
+            .map(|&x| {
+                if x == 0 {
+                    ov.zero_byte
+                } else {
+                    ov.non_zero_byte
+                }
+            })
+            .reduce(|a, b| a + b)
+            .unwrap_or_default();
+
+        ov.fixed / ov.bundle_size
+            + call_data_cost
+            + ov.per_user_op
+            + ov.per_user_op_word * length_in_words
+    }
+
+    fn verification_gas_limit_multiplier(uo: &UserOperation) -> u64 {
+        // If using a paymaster, we need to account for potentially 2 postOp
+        // calls (even though it won't be called).
+        // Else the entrypoint expects the gas for 1 postOp call that
+        // uses verification_gas_limit plus the actual verification call
+        if uo.paymaster().is_some() {
+            3
+        } else {
+            2
+        }
+    }
 }

@@ -37,7 +37,7 @@ pub use estimation::{
 };
 
 pub mod gas;
-pub use gas::{FeeEstimator, PriorityFeeMode};
+pub use gas::{BundleFeeEstimator, PriorityFeeMode, UOFeeEstimator};
 
 mod precheck;
 #[cfg(feature = "test-utils")]

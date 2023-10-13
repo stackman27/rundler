@@ -370,7 +370,7 @@ impl<P: Provider, E: EntryPoint> GasEstimatorImpl<P, E> {
         &self,
         op: &UserOperationOptionalGas,
     ) -> Result<U256, GasEstimationError> {
-        Ok(gas::calc_pre_verification_gas(
+        Ok(gas::UOFeeEstimator::calc_pre_verification_gas(
             &op.max_fill(&self.settings),
             &op.random_fill(&self.settings),
             self.entry_point.address(),

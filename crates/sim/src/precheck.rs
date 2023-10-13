@@ -44,7 +44,8 @@ pub struct PrecheckerImpl<P: Provider, E: EntryPoint> {
     provider: Arc<P>,
     entry_point: E,
     settings: Settings,
-    fee_estimator: gas::FeeEstimator<P>,
+    bundle_fee_estimator: gas::BundleFeeEstimator<P>,
+    uo_fee_estimator: gas::UOFeeEstimator<P>,
 }
 
 /// Precheck settings
@@ -109,17 +110,19 @@ impl<P: Provider, E: EntryPoint> Prechecker for PrecheckerImpl<P, E> {
 impl<P: Provider, E: EntryPoint> PrecheckerImpl<P, E> {
     /// Create a new prechecker
     pub fn new(provider: Arc<P>, entry_point: E, settings: Settings) -> Self {
+        let provider_clone = Arc::clone(&provider);
         Self {
-            provider: provider.clone(),
+            provider: provider_clone,
             entry_point,
             settings,
-            fee_estimator: gas::FeeEstimator::new(
+            bundle_fee_estimator: gas::BundleFeeEstimator::new(
                 provider,
                 settings.chain_id,
                 settings.priority_fee_mode,
                 settings.use_bundle_priority_fee,
                 settings.bundle_priority_fee_overhead_percent,
             ),
+            uo_fee_estimator: gas::UOFeeEstimator::new(provider_clone, settings.chain_id),
         }
     }
 
@@ -180,7 +183,7 @@ impl<P: Provider, E: EntryPoint> PrecheckerImpl<P, E> {
                 max_verification_gas,
             ));
         }
-        let total_gas_limit = gas::user_operation_gas_limit(op, chain_id);
+        let total_gas_limit = self.uo_fee_estimator.user_operation_gas_limit(op, chain_id);
         if total_gas_limit > max_total_execution_gas {
             violations.push(PrecheckViolation::TotalGasLimitTooHigh(
                 total_gas_limit,
@@ -194,7 +197,7 @@ impl<P: Provider, E: EntryPoint> PrecheckerImpl<P, E> {
             ));
         }
 
-        let required_fees = self.fee_estimator.required_op_fees(bundle_fees);
+        let required_fees = self.bundle_fee_estimator.required_op_fees(bundle_fees);
 
         if op.max_fee_per_gas < required_fees.max_fee_per_gas {
             violations.push(PrecheckViolation::MaxFeePerGasTooLow(
@@ -234,7 +237,7 @@ impl<P: Provider, E: EntryPoint> PrecheckerImpl<P, E> {
                 return Some(PrecheckViolation::PaymasterIsNotContract(paymaster));
             }
         }
-        let max_gas_cost = gas::user_operation_max_gas_cost(op);
+        let max_gas_cost = self.uo_fee_estimator.user_operation_max_gas_cost(op);
         if payer_funds < max_gas_cost {
             if op.paymaster_and_data.is_empty() {
                 return Some(PrecheckViolation::SenderFundsTooLow(
@@ -318,14 +321,14 @@ impl<P: Provider, E: EntryPoint> PrecheckerImpl<P, E> {
     }
 
     async fn get_bundle_fees(&self) -> anyhow::Result<GasFees> {
-        self.fee_estimator
+        self.bundle_fee_estimator
             .required_bundle_fees(None)
             .await
             .context("should get bundle fees")
     }
 
     async fn get_pre_verification_gas(&self, op: UserOperation) -> anyhow::Result<U256> {
-        gas::calc_pre_verification_gas(
+        gas::UOFeeEstimator::calc_pre_verification_gas(
             &op,
             &op,
             self.entry_point.address(),

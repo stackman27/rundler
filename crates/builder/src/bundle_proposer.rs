@@ -29,8 +29,8 @@ use mockall::automock;
 use rundler_pool::{PoolOperation, PoolServer};
 use rundler_provider::{EntryPoint, HandleOpsOut, Provider};
 use rundler_sim::{
-    gas, ExpectedStorage, FeeEstimator, PriorityFeeMode, SimulationError, SimulationSuccess,
-    Simulator,
+    BundleFeeEstimator, ExpectedStorage, PriorityFeeMode, SimulationError, SimulationSuccess,
+    Simulator, UOFeeEstimator,
 };
 use rundler_types::{Entity, EntityType, GasFees, Timestamp, UserOperation, UserOpsPerAggregator};
 use rundler_utils::{emit::WithEntryPoint, math};
@@ -93,7 +93,7 @@ where
     entry_point: E,
     provider: Arc<P>,
     settings: Settings,
-    fee_estimator: FeeEstimator<P>,
+    fee_estimator: BundleFeeEstimator<P>,
     event_sender: broadcast::Sender<WithEntryPoint<BuilderEvent>>,
 }
 
@@ -241,7 +241,7 @@ where
             simulator,
             entry_point,
             provider: provider.clone(),
-            fee_estimator: FeeEstimator::new(
+            fee_estimator: BundleFeeEstimator::new(
                 provider,
                 settings.chain_id,
                 settings.priority_fee_mode,
@@ -333,7 +333,7 @@ where
                     error!("Op had paymaster with unknown balance, but balances should have been loaded for all paymasters in bundle.");
                     continue;
                 };
-                let max_cost = gas::user_operation_max_gas_cost(&op);
+                let max_cost = gas::UOFeeEstimator::user_operation_max_gas_cost(&op);
                 if *balance < max_cost {
                     info!("Rejected paymaster {paymaster:?} because its balance {balance:?} was too low.");
                     paymasters_to_reject.push(paymaster);
@@ -538,7 +538,7 @@ where
         let mut gas_left = U256::from(self.settings.max_bundle_gas);
         let mut ops_in_bundle = Vec::new();
         for op in ops {
-            let gas = gas::user_operation_gas_limit(&op.uo, self.settings.chain_id);
+            let gas = gas::UOFeeEstimator::user_operation_gas_limit(&op.uo, self.settings.chain_id);
             if gas_left < gas {
                 self.emit(BuilderEvent::skipped_op(
                     self.builder_index,
@@ -740,7 +740,7 @@ impl ProposalContext {
 
     fn get_total_gas_limit(&self, chain_id: u64) -> U256 {
         self.iter_ops()
-            .map(|op| gas::user_operation_gas_limit(op, chain_id))
+            .map(|op| gas::UOFeeEstimator::user_operation_gas_limit(op, chain_id))
             .fold(U256::zero(), |acc, c| acc + c)
             + BUNDLE_TRANSACTION_GAS_OVERHEAD_BUFFER
     }

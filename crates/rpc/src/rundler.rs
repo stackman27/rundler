@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use ethers::types::U256;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::error::INTERNAL_ERROR_CODE};
 use rundler_provider::Provider;
-use rundler_sim::{FeeEstimator, PrecheckSettings};
+use rundler_sim::{BundleFeeEstimator, PrecheckSettings};
 
 use crate::error::rpc_err;
 
@@ -29,7 +29,7 @@ pub trait RundlerApi {
 }
 
 pub(crate) struct RundlerApi<P: Provider> {
-    fee_estimator: FeeEstimator<P>,
+    fee_estimator: BundleFeeEstimator<P>,
 }
 
 impl<P> RundlerApi<P>
@@ -38,7 +38,7 @@ where
 {
     pub(crate) fn new(provider: Arc<P>, chain_id: u64, settings: PrecheckSettings) -> Self {
         Self {
-            fee_estimator: FeeEstimator::new(
+            fee_estimator: BundleFeeEstimator::new(
                 provider,
                 chain_id,
                 settings.priority_fee_mode,
